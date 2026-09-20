@@ -1,0 +1,76 @@
+plugins {
+    id 'java'
+    id 'java-gradle-plugin'
+    id 'maven-publish'
+}
+
+group = 'io.github.nanoforged'
+version = '1.0-SNAPSHOT'
+
+repositories {
+    maven {
+        url = "https://maven.aliyun.com/repository/public/"
+    }
+    maven {
+        url = "https://maven.aliyun.com/repository/central"
+    }
+    maven {
+        name = "Fabric Repository"
+        url = 'https://maven.fabricmc.net'
+    }
+    maven {
+        name = "JitPack"
+        url = 'https://jitpack.io'
+    }
+}
+
+gradlePlugin {
+    plugins {
+        nanogradle {
+            id = 'io.github.nanoforged.nanogradle'
+            implementationClass = 'io.github.nanoforged.nanogradle.NanoGradle'
+        }
+    }
+}
+
+dependencies {
+    // 解压 NSIS 归档（含各平台原生库）
+    implementation 'net.sf.sevenzipjbinding:sevenzipjbinding:16.02-2.01'
+    implementation 'net.sf.sevenzipjbinding:sevenzipjbinding-all-platforms:16.02-2.01'
+
+    // 下载 + 磁盘缓存（~/.gradle/caches/okhttp，支持 304 复用）
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+
+    testImplementation gradleTestKit()
+    testImplementation platform('org.junit:junit-bom:5.10.0')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events "passed", "skipped", "failed"
+        exceptionFormat = "full"
+    }
+}
+
+java {
+    withSourcesJar()
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = "UTF-8"
+    options.release = 17
+}
+
+publishing {
+    publications {
+        pluginMaven(MavenPublication) {
+            artifactId = 'nanogradle'
+        }
+    }
+}

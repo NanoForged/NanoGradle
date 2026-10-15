@@ -1,43 +1,63 @@
 # NanoGradle
 
  A Simple Version of `SectorDevGradle`
----
 
-## 快速开始
+ AI Slop.
 
-在 `build.gradle` 中：
+## Usage
+
+in `settings.gradle`
+```groovy
+pluginManagement {
+        maven {
+            name = "JitPack"
+            url = "https://jitpack.io" // Required because we don't have a Maven repository yet.
+        }
+}
+```
+
+
+in  `build.gradle` :
 
 ```groovy
 plugins {
     id 'java'
-    id 'io.github.nanoforged.nanogradle' version '1.0-SNAPSHOT'
+    id 'io.github.nanoforged.nanogradle' version '-SNAPSHOT' // latest JitPack snapshot
 }
 
+
 nanogradle {
-    version = "0.97a"   // 版本号：会替换 URL 中的 {version}
-    // url 缺省指向官方 Windows 安装包地址：
-    //   https://f005.backblazeb2.com/file/fractalsoftworks/release/starsector_install-{version}.exe
+    version = "0.98a-RC8"
+    // default:
+    // url = https://f005.backblazeb2.com/file/fractalsoftworks/release/starsector_install-{version}.exe
+    
+    // game(0.98a) mirror of fossic 
+    // url = "https://cdn.fossic.cn/forum/202504/19/101929anj9i6zjidhinnnl.attach"
     runtimes {
-        include "fs.common_obf.jar", "starfarer_obf.jar", "fs.sound_obf.jar"
-        exclude "*-sources.jar"
-        targetDir = "runtime"           // → build/nanogradle/combined/runtime
+        include "starsector-core/fs.common_obf.jar",
+                "starsector-core/starfarer_obf.jar",
+                "starsector-core/fs.sound_obf.jar"
+        exclude "**/*-sources.jar"
+        targetDir = "runtime"
     }
 
     api {
-        include "starfarer.api.jar"
-        targetDir = "api"               // → build/nanogradle/combined/api
-        sourceJar = "starfarer.api.zip" // 元数据，预留供未来扩展
+        include "starsector-core/starfarer.api.jar"
+        targetDir = "api"
+        sourceJar = "starsector-core/starfarer.api.zip"
     }
 
     resources {
-        include "data/**", "graphics/**", "sounds/**"
+        include "starsector-core/data/**",
+                "starsector-core/graphics/**",
+                "starsector-core/sounds/**"
         exclude "**/*.tmp"
-        targetDir = "assets"            // → build/nanogradle/combined/assets
+        targetDir = "assets"
     }
 }
 
 dependencies {
-    runtimeOnly nanogradle.runtimes      // FileCollection 访问器
+    runtimeOnly nanogradle.runtimes
     implementation nanogradle.api
 }
 

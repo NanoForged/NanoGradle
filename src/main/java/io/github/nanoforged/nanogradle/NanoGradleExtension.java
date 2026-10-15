@@ -1,15 +1,18 @@
 package io.github.nanoforged.nanogradle;
 
 import io.github.nanoforged.nanogradle.dsl.DependencySet;
+import io.github.nanoforged.nanogradle.dsl.NanoSet;
 import io.github.nanoforged.nanogradle.dsl.ResourcesSet;
+import io.github.nanoforged.nanogradle.task.CollectArchiveTask;
 import groovy.lang.Closure;
 import org.gradle.api.Action;
 import org.gradle.api.Project;
 import org.gradle.api.file.ConfigurableFileTree;
+import org.gradle.api.file.Directory;
 import org.gradle.api.file.FileCollection;
 import org.gradle.api.model.ObjectFactory;
 import org.gradle.api.provider.Property;
-import org.gradle.api.tasks.Sync;
+import org.gradle.api.provider.Provider;
 import org.gradle.api.tasks.TaskProvider;
 
 import java.io.File;
@@ -40,7 +43,7 @@ import java.io.File;
  *     }
  * }
  * }</pre>
- * 访问器全部<b>惰性</b>：文件内容在对应 Sync 任务执行后解析，且通过 {@code builtBy}
+ * 访问器全部<b>惰性</b>：文件内容在唯一收集任务执行后解析，且通过 {@code builtBy}
  * 携带任务依赖，因此可直接在 dependencies / sourceSets 中使用：
  * <pre>{@code
  * dependencies {
@@ -66,6 +69,8 @@ public class NanoGradleExtension {
     private FileCollection apiFiles;
     /** 资源目录集合（combined/assets，单一目录），首次访问时惰性构建。 */
     private FileCollection resourcesDir;
+    /** 唯一的收集任务（取档 → 解压 → 收集）；访问器据此建立任务依赖。 */
+    private TaskProvider<CollectArchiveTask> collectTask;
 
     /**
      * 由插件通过 {@code extensions.create} 实例化。
@@ -196,33 +201,33 @@ public class NanoGradleExtension {
     // --- 惰性访问器（见设计文档 §4.3） ---
 
     /**
-     * runtime 依赖 JAR 的惰性 {@link FileCollection}（Sync 执行后解析，自带任务依赖）。
+     * runtime 依赖 JAR 的惰性 {@link FileCollection}（收集任务执行后解析，自带任务依赖）。
      * <p>
-     * 集合在首次访问时才构建（此时 Sync 任务已由插件注册完毕），之后缓存复用。
+     * 集合在首次访问时才构建（此时收集任务已由插件注册完毕），之后缓存复用。
      *
      * @return JAR 文件集合，可直接用于 {@code dependencies { runtimeOnly nanogradle.runtimes }}
      */
     public FileCollection getRuntimes() {
         if (runtimesFiles == null) {
-            runtimesFiles = jarFileCollection(NanoGradleDefaults.TASK_SYNC_RUNTIME);
+            runtimesFiles = jarFileCollection(runtimes);
         }
         return runtimesFiles;
     }
 
     /**
-     * api 依赖 JAR 的惰性 {@link FileCollection}（Sync 执行后解析，自带任务依赖）。
+     * api 依赖 JAR 的惰性 {@link FileCollection}（收集任务执行后解析，自带任务依赖）。
      *
      * @return JAR 文件集合，可直接用于 {@code dependencies { implementation nanogradle.api }}
      */
     public FileCollection getApi() {
         if (apiFiles == null) {
-            apiFiles = jarFileCollection(NanoGradleDefaults.TASK_SYNC_API);
+            apiFiles = jarFileCollection(api);
         }
         return apiFiles;
     }
 
     /**
-     * 资源输出目录的惰性 {@link FileCollection}（Sync 执行后解析，自带任务依赖）。
+     * 资源输出目录的惰性 {@link FileCollection}（收集任务执行后解析，自带任务依赖）。
      * <p>
      * 集合内容为单一目录（默认 {@code combined/assets}），可直接用于
      * {@code sourceSets.main.resources.srcDir nanogradle.resourcesDir}。
@@ -231,12 +236,21 @@ public class NanoGradleExtension {
      */
     public FileCollection getResourcesDir() {
         if (resourcesDir == null) {
-            resourcesDir = dirFileCollection(NanoGradleDefaults.TASK_SYNC_RESOURCES);
+            resourcesDir = project.files(targetDirOf(resources)).builtBy(collectTask);
         }
         return resourcesDir;
     }
 
-    // --- 内部：供插件注册 Sync 任务时读取规则 ---
+    // --- 内部：供插件注册收集任务时读取规则 ---
+
+    /**
+     * 由插件注册收集任务后注入（仅同包插件使用）。
+     *
+     * @param collectTask 唯一任务 {@code collectArchive}
+     */
+    void setCollectTask(TaskProvider<CollectArchiveTask> collectTask) {
+        this.collectTask = collectTask;
+    }
 
     /**
      * runtime 依赖集配置对象（仅同包插件使用）。
@@ -262,28 +276,27 @@ public class NanoGradleExtension {
     // --- 惰性文件集合构建 ---
 
     /**
-     * 构建 JAR 文件集合：Sync 输出目录（{@code combined/<targetDir>}）下所有 {@code *.jar}。
+     * 构建 JAR 文件集合：收集输出目录（{@code combined/<targetDir>}）下所有 {@code *.jar}。
      * <p>
-     * 目录来自对应 Sync 任务的输出，全部惰性解析，并携带该任务的构建依赖。
+     * 目录来自收集任务的输出，全部惰性解析，并携带该任务的构建依赖。
      *
-     * @param syncTaskName Sync 任务名
+     * @param set 集合规则
      * @return 带任务依赖的 JAR 文件集合
      */
-    private FileCollection jarFileCollection(String syncTaskName) {
-        TaskProvider<Sync> syncTask = project.getTasks().named(syncTaskName, Sync.class);
-        ConfigurableFileTree jarTree = project.fileTree(syncTask.map(Sync::getDestinationDir));
+    private FileCollection jarFileCollection(NanoSet set) {
+        ConfigurableFileTree jarTree = project.fileTree(targetDirOf(set));
         jarTree.include("**/*.jar");
-        return jarTree.builtBy(syncTask);
+        return jarTree.builtBy(collectTask);
     }
 
     /**
-     * 构建目录文件集合：Sync 输出目录本身（{@code combined/<targetDir>}）。
+     * 解析集合的输出目录 {@code <build>/nanogradle/combined/<targetDir>}。
      *
-     * @param syncTaskName Sync 任务名
-     * @return 带任务依赖的目录文件集合
+     * @param set 集合规则
+     * @return 惰性目录
      */
-    private FileCollection dirFileCollection(String syncTaskName) {
-        TaskProvider<Sync> syncTask = project.getTasks().named(syncTaskName, Sync.class);
-        return project.files(syncTask.map(Sync::getDestinationDir)).builtBy(syncTask);
+    private Provider<File> targetDirOf(NanoSet set) {
+        return collectTask.flatMap(CollectArchiveTask::getCombinedDir)
+                .zip(set.getTargetDir(), (Directory dir, String name) -> new File(dir.getAsFile(), name));
     }
 }

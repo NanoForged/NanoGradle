@@ -23,6 +23,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
+import java.util.Comparator;
+import java.util.UUID;
 
 /**
  * 下载与解压工具类。
@@ -38,6 +40,11 @@ public final class DownloadUtil {
 
     private static final long OKHTTP_CACHE_MAX_BYTES = 512L * 1024 * 1024; // 512 MiB
     private static final String USER_AGENT = "NanoGradle/1.0";
+
+    /**
+     * SevenZip 原生库临时解压目录的前缀，目录名形如 {@code nanogradle-sevenzip-<pid>-<token>}。
+     */
+    private static final String SEVENZIP_TMP_PREFIX = "nanogradle-sevenzip-";
 
     private static volatile boolean sevenZipReady;
 
@@ -140,7 +147,7 @@ public final class DownloadUtil {
      * @throws Exception 解压过程中的任意异常
      */
     public static void extractArchive(Path archive, Path outputDir, Logger logger) throws Exception {
-        ensureSevenZipInitialized();
+        ensureSevenZipInitialized(logger);
         Files.createDirectories(outputDir);
         logger.lifecycle("nanogradle: 解压 {} -> {}", archive.getFileName(), outputDir);
 
@@ -179,14 +186,26 @@ public final class DownloadUtil {
     }
 
     /**
-     * 初始化 SevenZip 原生库（从 all-platforms jar 中按平台加载，仅执行一次）。
+     * 初始化 SevenZip 原生库（从 all-platforms jar 中按平台加载，每个 classloader 代仅执行一次）。
      * <p>
-     * 使用进程号（PID）唯一的临时子目录，避免多个 Gradle 守护进程同时初始化时
-     * 对同一原生库文件的写冲突。
+     * <b>每次初始化都必须使用一个全新的临时目录</b>，原因有两条：
+     * <ol>
+     *   <li>SevenZipJBinding 16.02-2.01 的“已解压则跳过”校验失效：其
+     *       {@code SevenZip.byteArrayToHex} 不补零，算出的 SHA1 十六进制串比 properties 中的
+     *       期望值短，比较<b>永不相等</b>，所以它在文件已存在时依然会重写原生库；</li>
+     *   <li>Gradle 守护进程存活期间插件 classloader 会被重建，新一代 {@code SevenZip} 的静态
+     *       状态归零后会再次初始化。此时若沿用同一路径，就会覆盖本进程已映射加载、在 Windows
+     *       上不可写入的 DLL，抛出 {@code can't copy native library out of a resource file to
+     *       the temporary location} 并令解压任务失败。</li>
+     * </ol>
+     * 复用已被本进程加载的 DLL 也不可行：同一路径无法在第二个 classloader 中重新
+     * {@code System.load}（JVM 直接抛 {@code UnsatisfiedLinkError: already loaded in
+     * another classloader}），所以独立目录是唯一可行的方案。
      *
-     * @throws GradleException 原生库加载失败时抛出
+     * @param logger Gradle 日志
+     * @throws GradleException 原生库加载或解压失败时抛出
      */
-    private static void ensureSevenZipInitialized() {
+    private static void ensureSevenZipInitialized(Logger logger) {
         if (sevenZipReady) {
             return;
         }
@@ -194,15 +213,99 @@ public final class DownloadUtil {
             if (sevenZipReady) {
                 return;
             }
+            Path libDir = null;
             try {
-                long pid = ProcessHandle.current().pid();
-                Path libDir = Path.of(System.getProperty("java.io.tmpdir"), "nanogradle-sevenzip-" + pid);
+                cleanupStaleLibDirs(logger);
+                String token = UUID.randomUUID().toString().substring(0, 8);
+                libDir = Path.of(System.getProperty("java.io.tmpdir"),
+                        SEVENZIP_TMP_PREFIX + ProcessHandle.current().pid() + "-" + token);
                 Files.createDirectories(libDir);
                 SevenZip.initSevenZipFromPlatformJAR(libDir.toFile());
                 sevenZipReady = true;
             } catch (SevenZipNativeInitializationException | IOException e) {
                 throw new GradleException("nanogradle: SevenZip 原生库加载失败，请检查 sevenzipjbinding-all-platforms 依赖", e);
+            } catch (RuntimeException e) {
+                throw new GradleException("nanogradle: SevenZip 原生库解压失败，临时目录 " + libDir
+                        + "（可删除 java.io.tmpdir 下的 " + SEVENZIP_TMP_PREFIX + "* 后重试）", e);
             }
+        }
+    }
+
+    /**
+     * 清理其他已退出进程残留在临时目录下的 SevenZip 解压目录。
+     * <p>
+     * 原生库文件在本进程存活期间无法删除（Windows 上被映射占用），因此只能在每次初始化前
+     * 顺手回收死进程的目录，避免 {@code java.io.tmpdir} 按守护进程数累积约 5 MB 的 DLL。
+     * 任何清理失败都不影响初始化，仅记录日志。
+     *
+     * @param logger Gradle 日志
+     */
+    private static void cleanupStaleLibDirs(Logger logger) {
+        Path tmpDir;
+        try {
+            tmpDir = Path.of(System.getProperty("java.io.tmpdir"));
+        } catch (RuntimeException e) {
+            return;
+        }
+        if (!Files.isDirectory(tmpDir)) {
+            return;
+        }
+        long selfPid = ProcessHandle.current().pid();
+        try (var entries = Files.list(tmpDir)) {
+            for (Path dir : entries.toList()) {
+                String name = dir.getFileName().toString();
+                if (!name.startsWith(SEVENZIP_TMP_PREFIX) || !Files.isDirectory(dir)) {
+                    continue;
+                }
+                long pid = parsePid(name);
+                // pid 无法识别、是自己、或该进程仍然活着（可能是并发的另一次构建）时一律跳过
+                if (pid < 0 || pid == selfPid || ProcessHandle.of(pid).isPresent()) {
+                    continue;
+                }
+                if (deleteRecursively(dir)) {
+                    logger.info("nanogradle: 已清理残留的 SevenZip 临时目录 {}", dir);
+                }
+            }
+        } catch (IOException e) {
+            logger.debug("nanogradle: 清理 SevenZip 临时目录失败（已忽略）：{}", e.toString());
+        }
+    }
+
+    /**
+     * 从 SevenZip 临时目录名中解析出所属进程号。
+     *
+     * @param name 目录名，形如 {@code nanogradle-sevenzip-<pid>[-<token>]}
+     * @return 进程号，格式无法识别时返回 {@code -1}
+     */
+    private static long parsePid(String name) {
+        String rest = name.substring(SEVENZIP_TMP_PREFIX.length());
+        int dash = rest.indexOf('-');
+        if (dash > 0) {
+            rest = rest.substring(0, dash);
+        }
+        try {
+            return Long.parseLong(rest);
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /**
+     * 递归删除目录及其内容，失败时返回 {@code false} 而不抛出。
+     * <p>
+     * 与任务层的删除不同，这里删除的是可再生的临时残留，失败（例如仍被占用）不是错误。
+     *
+     * @param dir 目标目录
+     * @return 目录已不存在时返回 {@code true}
+     */
+    private static boolean deleteRecursively(Path dir) {
+        try (var paths = Files.walk(dir)) {
+            for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) {
+                Files.deleteIfExists(path);
+            }
+            return true;
+        } catch (IOException | RuntimeException e) {
+            return false;
         }
     }
 

@@ -1,33 +1,24 @@
 package io.github.nanoforged.nanogradle;
 
 import io.github.nanoforged.nanogradle.dsl.NanoSet;
-import io.github.nanoforged.nanogradle.task.DownloadTask;
-import io.github.nanoforged.nanogradle.task.ExtractTask;
+import io.github.nanoforged.nanogradle.task.CollectArchiveTask;
+import io.github.nanoforged.nanogradle.util.DownloadUtil;
 import org.gradle.api.Plugin;
 import org.gradle.api.Project;
-import org.gradle.api.file.CopySpec;
-import org.gradle.api.file.Directory;
-import org.gradle.api.file.FileTreeElement;
 import org.gradle.api.provider.Provider;
-import org.gradle.api.specs.Spec;
-import org.gradle.api.tasks.Sync;
 import org.gradle.api.tasks.TaskProvider;
 
-import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
- * NanoGradle 插件入口（见设计文档 §2.1、§3、§6.1）。
+ * NanoGradle 插件入口。
  * <p>
- * 任务流水线（全部惰性注册，仅在使用时被 realize）：
- * <pre>
- * downloadNsis (DownloadTask) → extractNsis (ExtractTask) → syncNanoRuntime / syncNanoApi / syncNanoResources (原生 Sync)
- * </pre>
- * 分类阶段直接复用 Gradle 原生 {@link Sync} 任务：
- * <ul>
- *   <li>每个集合一个 Sync，从 {@code extracted/} 按 include/exclude 规则分类复制；</li>
- *   <li>Sync 自带文件快照与目标目录镜像（删除陈旧文件）能力，无需自写复制逻辑；</li>
- *   <li>规则在 copy spec <b>执行期</b>惰性读取，天然拿到用户最终配置（见设计文档 §3.3、§5.2）。</li>
- * </ul>
+ * 只注册<b>一个</b>任务 {@code collectArchive}（{@link CollectArchiveTask}）：
+ * 取档 → 7z 解压 → 按 DSL 声明的集合收集到 {@code build/nanogradle/combined/<targetDir>/}。
+ * <p>
+ * 集合规则在任务执行期才读取，因此用户在任何时机配置都生效，无需 {@code afterEvaluate}。
+ * 规则同时被规范化成 {@code @Input}（见 {@link #collectionRules}），保证改规则必然让任务重跑。
  */
 public class NanoGradle implements Plugin<Project> {
 
@@ -36,101 +27,88 @@ public class NanoGradle implements Plugin<Project> {
         NanoGradleExtension extension =
                 project.getExtensions().create("nanogradle", NanoGradleExtension.class, project);
 
-        // Download: build/nanogradle/Game.zip
-        TaskProvider<DownloadTask> downloadNsis = project.getTasks().register(
-                NanoGradleDefaults.TASK_DOWNLOAD, DownloadTask.class, task -> {
+        TaskProvider<CollectArchiveTask> collect = project.getTasks().register(
+                NanoGradleDefaults.TASK_COLLECT, CollectArchiveTask.class, task -> {
                     task.setGroup(NanoGradleDefaults.GROUP);
-                    task.setDescription("下载游戏安装包到 Game.zip（OkHttp + 磁盘缓存；version 变更即重下）");
-                    task.getVersion().convention(extension.getVersion());
-                    task.getUrl().convention(extension.getUrl());
-                    task.getHttpCacheDir().convention(project.getGradle().getGradleUserHomeDir());
-                    task.getGameArchive().convention(
-                            project.getLayout().getBuildDirectory().file(NanoGradleDefaults.ARCHIVE_PATH));
-                });
+                    task.setDescription("从远端存档解压并按 nanogradle DSL 收集内容到 combined/"
+                            + "（7z 按内容识别格式，不支持即失败）");
 
-        // Extract: build/nanogradle/extracted
-        TaskProvider<ExtractTask> extractNsis = project.getTasks().register(
-                NanoGradleDefaults.TASK_EXTRACT, ExtractTask.class, task -> {
-                    task.setGroup(NanoGradleDefaults.GROUP);
-                    task.setDescription("使用 SevenZipJBinding 解压 Game.zip（按内容自动识别 NSIS/zip 等格式）");
-                    task.getGameArchive().set(downloadNsis.flatMap(DownloadTask::getGameArchive));
-                    task.dependsOn(downloadNsis);
+                    Provider<String> version = extension.getVersion();
+                    task.getVersion().set(version);
+                    task.getUrl().set(extension.getUrl().zip(version, DownloadUtil::buildUrl));
+
+                    task.getArchive().set(
+                            project.getLayout().getBuildDirectory().file(NanoGradleDefaults.ARCHIVE_PATH));
                     task.getExtractedDir().convention(
                             project.getLayout().getBuildDirectory().dir(NanoGradleDefaults.EXTRACTED_DIR));
+                    task.getCombinedDir().convention(
+                            project.getLayout().getBuildDirectory().dir(NanoGradleDefaults.COMBINED_DIR));
+                    task.getHttpCacheDir().set(project.getGradle().getGradleUserHomeDir());
+
+                    task.getSets().put(NanoGradleDefaults.SET_RUNTIME, extension.getRuntimesConfig());
+                    task.getSets().put(NanoGradleDefaults.SET_API, extension.getApiConfig());
+                    task.getSets().put(NanoGradleDefaults.SET_RESOURCES, extension.getResourcesConfig());
+
+                    task.getCollectionRules().set(project.provider(() -> collectionRules(extension)));
+                    task.getHasCustomSpecs().set(project.provider(() -> hasCustomSpecs(extension)));
                 });
 
-        // 分类 Sync：每个集合一个原生 Sync 任务（combined/<targetDir>）
-        registerSync(project, extractNsis, NanoGradleDefaults.TASK_SYNC_RUNTIME,
-                "分类复制 runtime 依赖 JAR 到 combined/runtime", extension.getRuntimesConfig());
-        registerSync(project, extractNsis, NanoGradleDefaults.TASK_SYNC_API,
-                "分类复制 api 依赖 JAR 到 combined/api", extension.getApiConfig());
-        registerSync(project, extractNsis, NanoGradleDefaults.TASK_SYNC_RESOURCES,
-                "分类复制资源到 combined/assets", extension.getResourcesConfig());
+        extension.setCollectTask(collect);
     }
 
     /**
-     * 为一个集合注册原生 {@link Sync} 任务。
+     * 把三个集合的规则规范化成可指纹化的行列表。
      * <p>
-     * 输出目录为 {@code build/nanogradle/combined/<targetDir>}（每个集合独立，
-     * 避免多个 Sync 共享同一输出根目录相互覆盖）；目标目录通过 provider 惰性解析，
-     * 规则在 copy spec <b>执行期</b>惰性读取，因而无需 afterEvaluate；
-     * 集合未配置任何 include/exclude 时任务被 {@code onlyIf} 跳过。
+     * 规则变化必须让任务重跑，否则收集产物会陈旧；每行形如
+     * {@code <集合名>:<include|exclude|targetDir>:<值>}。
      *
-     * @param project     项目
-     * @param extractNsis 解压任务（输出 extracted/）
-     * @param taskName    任务名
-     * @param description 任务描述
-     * @param set         集合配置
-     * @return 任务提供者
+     * @param extension 插件扩展（执行期读取，拿到用户最终配置）
+     * @return 规范化规则行
      */
-    private TaskProvider<Sync> registerSync(Project project, TaskProvider<ExtractTask> extractNsis,
-                                            String taskName, String description, NanoSet set) {
-        return project.getTasks().register(taskName, Sync.class, task -> {
-            task.setGroup(NanoGradleDefaults.GROUP);
-            task.setDescription(description);
-            task.into(targetDirOf(project, set));
-            task.dependsOn(extractNsis);
-            task.from(extractNsis.flatMap(ExtractTask::getExtractedDir), spec -> applySpec(spec, set));
-            task.onlyIf(t -> set.isConfigured());
-        });
+    private static List<String> collectionRules(NanoGradleExtension extension) {
+        List<String> rules = new ArrayList<>();
+        appendRules(rules, NanoGradleDefaults.SET_RUNTIME, extension.getRuntimesConfig());
+        appendRules(rules, NanoGradleDefaults.SET_API, extension.getApiConfig());
+        appendRules(rules, NanoGradleDefaults.SET_RESOURCES, extension.getResourcesConfig());
+        return rules;
     }
 
     /**
-     * 惰性解析 Sync 目标目录：{@code build/nanogradle/combined/<targetDir>}。
+     * 追加单个集合的规则行。
      *
-     * @param project 项目
-     * @param set     集合配置
-     * @return 目标目录的惰性 {@link File}
+     * @param rules 结果列表
+     * @param name  集合名
+     * @param set   集合规则
      */
-    private static Provider<File> targetDirOf(Project project, NanoSet set) {
-        Provider<File> combined = project.getLayout().getBuildDirectory()
-                .dir(NanoGradleDefaults.COMBINED_DIR)
-                .map(Directory::getAsFile);
-        return combined.zip(set.getTargetDir(), (root, sub) -> new File(root, sub));
+    private static void appendRules(List<String> rules, String name, NanoSet set) {
+        rules.add(name + ":targetDir:" + set.getTargetDir().getOrElse(""));
+        for (String include : set.getIncludes()) {
+            rules.add(name + ":include:" + include);
+        }
+        for (String exclude : set.getExcludes()) {
+            rules.add(name + ":exclude:" + exclude);
+        }
     }
 
     /**
-     * 把集合的 include/exclude（字符串模式 + Spec）应用到 Sync 的 copy spec。
-     * <p>
-     * 该方法在任务执行期调用：此时集合已被用户配置完毕。
+     * 是否存在 Spec/闭包形式的规则。
      *
-     * @param spec copy spec
-     * @param set  集合配置
+     * @param extension 插件扩展
+     * @return 任意集合存在 Spec 规则返回 {@code true}
      */
-    private static void applySpec(CopySpec spec, NanoSet set) {
-        String[] includes = set.getIncludes().toArray(new String[0]);
-        String[] excludes = set.getExcludes().toArray(new String[0]);
-        if (includes.length > 0) {
-            spec.include(includes);
-        }
-        if (excludes.length > 0) {
-            spec.exclude(excludes);
-        }
-        for (Spec<FileTreeElement> includeSpec : set.getIncludeSpecs()) {
-            spec.include(includeSpec);
-        }
-        for (Spec<FileTreeElement> excludeSpec : set.getExcludeSpecs()) {
-            spec.exclude(excludeSpec);
-        }
+    private static boolean hasCustomSpecs(NanoGradleExtension extension) {
+        return hasCustomSpecs(extension.getRuntimesConfig())
+                || hasCustomSpecs(extension.getApiConfig())
+                || hasCustomSpecs(extension.getResourcesConfig());
+    }
+
+    /**
+     * 单个集合是否存在 Spec 规则。
+     *
+     * @param set 集合规则
+     * @return 存在 Spec 规则返回 {@code true}
+     */
+    private static boolean hasCustomSpecs(NanoSet set) {
+        return !set.getIncludeSpecs().isEmpty() || !set.getExcludeSpecs().isEmpty();
     }
 }

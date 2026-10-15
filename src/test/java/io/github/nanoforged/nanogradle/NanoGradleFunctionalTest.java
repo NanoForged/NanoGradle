@@ -32,7 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * NanoGradle 插件端到端功能测试（TestKit + 本地 HTTP fixture，无需外网）。
  * <p>
- * 覆盖：全链路下载→解压→分类 Sync→依赖/资源接入、UP-TO-DATE 增量、HTTP 304 磁盘缓存、
+ * 覆盖：全链路取档→解压→按 DSL 收集→依赖/资源接入、UP-TO-DATE 增量、HTTP 304 磁盘缓存、
  * 版本变更重下载、配置缓存兼容性。
  */
 class NanoGradleFunctionalTest {
@@ -70,19 +70,15 @@ class NanoGradleFunctionalTest {
     // ------------------------------------------------------------------
 
     @Test
-    void fullPipelineDownloadsExtractsAndSyncs() throws IOException {
+    void fullPipelineCollectsDeclaredContent() throws IOException {
         Path project = newProject("consumer1");
         writeDefaultBuild(project, "0.97a");
 
         BuildResult result = build(project, "jar", "resolveRuntime");
-        assertTask(result, ":downloadNsis", TaskOutcome.SUCCESS);
-        assertTask(result, ":extractNsis", TaskOutcome.SUCCESS);
-        assertTask(result, ":syncNanoRuntime", TaskOutcome.SUCCESS);
-        assertTask(result, ":syncNanoApi", TaskOutcome.SUCCESS);
-        assertTask(result, ":syncNanoResources", TaskOutcome.SUCCESS);
+        assertTask(result, ":collectArchive", TaskOutcome.SUCCESS);
 
         // 下载产物
-        assertTrue(Files.isRegularFile(project.resolve("build/nanogradle/Game.zip")));
+        assertTrue(Files.isRegularFile(project.resolve("build/nanogradle/payload")));
         // 解压产物
         assertTrue(Files.isRegularFile(project.resolve("build/nanogradle/extracted/starfarer.api.jar")));
         assertTrue(Files.isRegularFile(project.resolve("build/nanogradle/extracted/data/campaign/factions.csv")));
@@ -121,11 +117,7 @@ class NanoGradleFunctionalTest {
         build(project, "jar", "resolveRuntime");
         BuildResult result = build(project, "jar", "resolveRuntime");
 
-        assertTask(result, ":downloadNsis", TaskOutcome.UP_TO_DATE);
-        assertTask(result, ":extractNsis", TaskOutcome.UP_TO_DATE);
-        assertTask(result, ":syncNanoRuntime", TaskOutcome.UP_TO_DATE);
-        assertTask(result, ":syncNanoApi", TaskOutcome.UP_TO_DATE);
-        assertTask(result, ":syncNanoResources", TaskOutcome.UP_TO_DATE);
+        assertTask(result, ":collectArchive", TaskOutcome.UP_TO_DATE);
         assertEquals(1, http.requestCount(), "第二次构建不应产生任何网络请求");
     }
 
@@ -139,23 +131,19 @@ class NanoGradleFunctionalTest {
         writeDefaultBuild(project, "0.97a");
         build(project, "jar", "resolveRuntime");
 
-        // 0.98a：URL 变更 → 下载重跑；内容也变更 → 解压、Sync 重跑
+        // 0.98a：URL 变更 → 输入变更 → 收集任务重跑（重新取档 + 解压 + 收集）
         writeDefaultBuild(project, "0.98a");
         BuildResult changed = build(project, "jar", "resolveRuntime");
-        assertTask(changed, ":downloadNsis", TaskOutcome.SUCCESS);
-        assertTask(changed, ":extractNsis", TaskOutcome.SUCCESS);
-        assertTask(changed, ":syncNanoResources", TaskOutcome.SUCCESS);
+        assertTask(changed, ":collectArchive", TaskOutcome.SUCCESS);
 
-        // 回退 0.97a：URL 相对 0.98a 历史再次变更 → 重跑一次
+        // 回退 0.97a：输入相对上次执行再次变更 → 重跑一次
         writeDefaultBuild(project, "0.97a");
         BuildResult reverted = build(project, "jar", "resolveRuntime");
-        assertTask(reverted, ":downloadNsis", TaskOutcome.SUCCESS);
-        assertTask(reverted, ":extractNsis", TaskOutcome.SUCCESS);
+        assertTask(reverted, ":collectArchive", TaskOutcome.SUCCESS);
 
         // 稳定后再构建：回到 UP-TO-DATE，且此后不再产生网络请求
         BuildResult stable = build(project, "jar", "resolveRuntime");
-        assertTask(stable, ":downloadNsis", TaskOutcome.UP_TO_DATE);
-        assertTask(stable, ":extractNsis", TaskOutcome.UP_TO_DATE);
+        assertTask(stable, ":collectArchive", TaskOutcome.UP_TO_DATE);
         assertEquals(3, http.requestCount());
     }
 
@@ -168,19 +156,19 @@ class NanoGradleFunctionalTest {
         Path project = newProject("consumer6");
         writeDefaultBuild(project, "0.97a", true);
         BuildResult first = build(project, "jar");
-        assertTask(first, ":downloadNsis", TaskOutcome.SUCCESS);
+        assertTask(first, ":collectArchive", TaskOutcome.SUCCESS);
         assertEquals(1, http.requestCount());
 
-        // URL 不变仅换版本 → downloadNsis 必须重新执行（version 输入变更）
+        // URL 不变仅换版本 → 收集任务必须重新执行（version 是输入），取档走 OkHttp 304 复验
         writeDefaultBuild(project, "0.98a", true);
         BuildResult changed = build(project, "jar");
-        assertTask(changed, ":downloadNsis", TaskOutcome.SUCCESS);
+        assertTask(changed, ":collectArchive", TaskOutcome.SUCCESS);
         assertEquals(2, http.requestCount(), "固定 URL 下切换版本应重下（OkHttp 304 复验）");
         assertEquals("304", http.lastResponseCode());
 
         // 再稳定一次 → UP-TO-DATE
         BuildResult stable = build(project, "jar");
-        assertTask(stable, ":downloadNsis", TaskOutcome.UP_TO_DATE);
+        assertTask(stable, ":collectArchive", TaskOutcome.UP_TO_DATE);
         assertEquals(2, http.requestCount());
     }
 
@@ -196,21 +184,20 @@ class NanoGradleFunctionalTest {
         assertEquals(1, http.requestCount());
         assertEquals("200", http.lastResponseCode(), "首次构建应为全量 200");
 
-        // clean 后重跑：downloadNsis 重新执行，但 OkHttp 磁盘缓存命中 → 304 条件请求
+        // clean 后重跑：收集任务重新执行，取档命中 OkHttp 磁盘缓存 → 304 条件请求
         BuildResult afterClean = build(project, "clean", "jar");
-        assertTask(afterClean, ":downloadNsis", TaskOutcome.SUCCESS);
-        assertTask(afterClean, ":extractNsis", TaskOutcome.SUCCESS);
+        assertTask(afterClean, ":collectArchive", TaskOutcome.SUCCESS);
         assertEquals(2, http.requestCount(), "clean 后应仅发生一次条件请求");
         assertEquals("304", http.lastResponseCode(), "clean 后重跑应命中 304 而非全量 200");
 
-        // 强制重跑：downloadNsis 再次执行，仍为 304 条件请求
+        // 强制重跑：收集任务再次执行，取档仍为 304 条件请求
         BuildResult forced = build(project, "--rerun-tasks", "jar");
-        assertTask(forced, ":downloadNsis", TaskOutcome.SUCCESS);
+        assertTask(forced, ":collectArchive", TaskOutcome.SUCCESS);
         assertEquals(3, http.requestCount());
         assertEquals("304", http.lastResponseCode(), "强制重跑应命中 304 而非全量 200");
 
-        // 下载产物完好
-        assertTrue(Files.isRegularFile(project.resolve("build/nanogradle/Game.zip")));
+        // 存档产物完好
+        assertTrue(Files.isRegularFile(project.resolve("build/nanogradle/payload")));
     }
 
     // ------------------------------------------------------------------
@@ -223,14 +210,12 @@ class NanoGradleFunctionalTest {
         writeDefaultBuild(project, "0.97a");
 
         BuildResult first = build(project, "--configuration-cache", "jar", "resolveRuntime");
-        assertTask(first, ":downloadNsis", TaskOutcome.SUCCESS);
-        assertTask(first, ":syncNanoRuntime", TaskOutcome.SUCCESS);
+        assertTask(first, ":collectArchive", TaskOutcome.SUCCESS);
 
         BuildResult second = build(project, "--configuration-cache", "jar", "resolveRuntime");
         assertTrue(second.getOutput().contains("Configuration cache entry reused"),
                 "第二次构建应复用配置缓存条目，实际输出:\n" + second.getOutput());
-        assertTask(second, ":downloadNsis", TaskOutcome.UP_TO_DATE);
-        assertTask(second, ":syncNanoRuntime", TaskOutcome.UP_TO_DATE);
+        assertTask(second, ":collectArchive", TaskOutcome.UP_TO_DATE);
 
         // 分类产物仍在
         assertEquals(
